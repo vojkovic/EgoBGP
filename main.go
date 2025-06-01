@@ -21,12 +21,13 @@ import (
 
 const (
 	// Version information
-	Version = "1.0.0"
+	Version = "1.0.1"
 
 	// Default values
 	defaultHealthCheckInterval = 10
 	defaultSuccessThreshold   = 1
 	defaultFailureThreshold   = 4 // 4 failures before withdrawing
+	defaultBGPPort           = 179
 	bgpTimeout               = 5 * time.Second
 	healthCheckTimeout       = 5 * time.Second
 
@@ -40,7 +41,9 @@ const (
 type Config struct {
 	LocalASN            uint32
 	RouterID            string
+	LocalPort           int
 	PeerIP              string
+	PeerPort            int
 	PeerASN             uint32
 	NextHop             string
 	PrefixToAnnounce    string
@@ -79,6 +82,14 @@ func (c *Config) validate() error {
 	// Validate URL
 	if _, err := http.NewRequest("GET", c.HealthCheckURL, nil); err != nil {
 		return fmt.Errorf("invalid HEALTH_CHECK_URL: %v", err)
+	}
+
+	// Validate ports
+	if c.LocalPort < 1 || c.LocalPort > 65535 {
+		return fmt.Errorf("invalid LOCAL_PORT: must be between 1 and 65535")
+	}
+	if c.PeerPort < 1 || c.PeerPort > 65535 {
+		return fmt.Errorf("invalid PEER_PORT: must be between 1 and 65535")
 	}
 
 	// Validate thresholds
@@ -145,11 +156,15 @@ func LoadConfig() (*Config, error) {
 	healthCheckInterval := getEnvInt("HEALTH_CHECK_INTERVAL", defaultHealthCheckInterval)
 	successThreshold := getEnvInt("SUCCESS_THRESHOLD", defaultSuccessThreshold)
 	failureThreshold := getEnvInt("FAILURE_THRESHOLD", defaultFailureThreshold)
+	localPort := getEnvInt("LOCAL_PORT", defaultBGPPort)
+	peerPort := getEnvInt("PEER_PORT", defaultBGPPort)
 
 	cfg := &Config{
 		LocalASN:            uint32(localASN),
 		RouterID:            routerID,
+		LocalPort:           localPort,
 		PeerIP:              peerIP,
+		PeerPort:            peerPort,
 		PeerASN:             uint32(peerASN),
 		NextHop:             nextHop,
 		PrefixToAnnounce:    prefixToAnnounce,
@@ -197,7 +212,7 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 		Global: &api.Global{
 			Asn:        cfg.LocalASN,
 			RouterId:   cfg.RouterID,
-			ListenPort: -1, // Disable listening
+			ListenPort: int32(cfg.LocalPort),
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to start BGP server: %v", err)
@@ -218,6 +233,8 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 			},
 			Transport: &api.Transport{
 				PassiveMode: false,
+				RemotePort: uint32(cfg.PeerPort),
+				LocalPort:  uint32(cfg.LocalPort),
 			},
 			AfiSafis: func() []*api.AfiSafi {
 				afiSafis := make([]*api.AfiSafi, 0, len(families))
@@ -236,8 +253,8 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 		return nil, fmt.Errorf("failed to add peer: %v", err)
 	}
 
-	log.Infof("BGP server started (AS%d, Router ID: %s)", cfg.LocalASN, cfg.RouterID)
-	log.Infof("Configured peer: %s (AS%d)", cfg.PeerIP, cfg.PeerASN)
+	log.Infof("BGP server started (AS%d, Router ID: %s, Port: %d)", cfg.LocalASN, cfg.RouterID, cfg.LocalPort)
+	log.Infof("Configured peer: %s:%d (AS%d)", cfg.PeerIP, cfg.PeerPort, cfg.PeerASN)
 
 	return &BGPServer{
 		s:      s,

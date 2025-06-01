@@ -14,6 +14,8 @@ A minimal BGP announcer that dynamically announces/withdraws a prefix based on H
 
 ## Optional Environment Variables
 
+- `LOCAL_PORT` - Local BGP port to listen on (default: 179)
+- `PEER_PORT` - BGP peer port (default: 179)
 - `HEALTH_CHECK_INTERVAL` - Interval in seconds (default: 10)
 - `SUCCESS_THRESHOLD` - Consecutive successes needed to announce (default: 1)
 - `FAILURE_THRESHOLD` - Consecutive failures needed to withdraw (default: 4)
@@ -47,6 +49,7 @@ docker build -t egobgp .
 Run:
 ```bash
 docker run -d \
+  -p 179:179 \
   -e LOCAL_ASN=65100 \
   -e ROUTER_ID=192.0.2.10 \
   -e PEER_IP=192.0.2.20 \
