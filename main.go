@@ -21,7 +21,7 @@ import (
 
 const (
 	// Version information
-	Version = "1.0.1"
+	Version = "1.0.2"
 
 	// Default values
 	defaultHealthCheckInterval = 10
@@ -42,6 +42,7 @@ type Config struct {
 	LocalASN            uint32
 	RouterID            string
 	LocalPort           int
+	LocalAddress        string
 	PeerIP              string
 	PeerPort            int
 	PeerASN             uint32
@@ -72,6 +73,13 @@ func (c *Config) validate() error {
 	}
 	if ip := net.ParseIP(c.NextHop); ip == nil {
 		return fmt.Errorf("invalid NEXT_HOP: not a valid IP address")
+	}
+
+	// Validate local address if specified
+	if c.LocalAddress != "" {
+		if ip := net.ParseIP(c.LocalAddress); ip == nil {
+			return fmt.Errorf("invalid LOCAL_ADDRESS: not a valid IP address")
+		}
 	}
 
 	// Validate prefix
@@ -158,11 +166,13 @@ func LoadConfig() (*Config, error) {
 	failureThreshold := getEnvInt("FAILURE_THRESHOLD", defaultFailureThreshold)
 	localPort := getEnvInt("LOCAL_PORT", defaultBGPPort)
 	peerPort := getEnvInt("PEER_PORT", defaultBGPPort)
+	localAddress := os.Getenv("LOCAL_ADDRESS") // Optional, defaults to wildcard if not set
 
 	cfg := &Config{
 		LocalASN:            uint32(localASN),
 		RouterID:            routerID,
 		LocalPort:           localPort,
+		LocalAddress:        localAddress,
 		PeerIP:              peerIP,
 		PeerPort:            peerPort,
 		PeerASN:             uint32(peerASN),
@@ -208,12 +218,18 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), bgpTimeout)
 	defer cancel()
 
+	global := &api.Global{
+		Asn:        cfg.LocalASN,
+		RouterId:   cfg.RouterID,
+		ListenPort: int32(cfg.LocalPort),
+	}
+	
+	if cfg.LocalAddress != "" {
+		global.ListenAddresses = []string{cfg.LocalAddress}
+	}
+
 	if err := s.StartBgp(ctx, &api.StartBgpRequest{
-		Global: &api.Global{
-			Asn:        cfg.LocalASN,
-			RouterId:   cfg.RouterID,
-			ListenPort: int32(cfg.LocalPort),
-		},
+		Global: global,
 	}); err != nil {
 		return nil, fmt.Errorf("failed to start BGP server: %v", err)
 	}
@@ -254,6 +270,9 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 	}
 
 	log.Infof("BGP server started (AS%d, Router ID: %s, Port: %d)", cfg.LocalASN, cfg.RouterID, cfg.LocalPort)
+	if cfg.LocalAddress != "" {
+		log.Infof("BGP server bound to address: %s", cfg.LocalAddress)
+	}
 	log.Infof("Configured peer: %s:%d (AS%d)", cfg.PeerIP, cfg.PeerPort, cfg.PeerASN)
 
 	return &BGPServer{
