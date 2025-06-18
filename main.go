@@ -22,7 +22,7 @@ import (
 
 const (
 	// Version information
-	Version = "1.1.0"
+	Version = "1.2.0"
 
 	// Default values
 	defaultHealthCheckInterval = 10
@@ -47,7 +47,8 @@ type Config struct {
 	PeerIP              string
 	PeerPort            int
 	PeerASN             uint32
-	NextHop             string
+	NextHopIPv4         string
+	NextHopIPv6         string
 	PrefixesToAnnounce  []string
 	HealthCheckURL      string
 	HealthCheckInterval int
@@ -72,8 +73,17 @@ func (c *Config) validate() error {
 	if ip := net.ParseIP(c.PeerIP); ip == nil {
 		return fmt.Errorf("invalid PEER_IP: not a valid IP address")
 	}
-	if ip := net.ParseIP(c.NextHop); ip == nil {
-		return fmt.Errorf("invalid NEXT_HOP: not a valid IP address")
+	
+	// Validate next-hop addresses
+	if c.NextHopIPv4 != "" {
+		if ip := net.ParseIP(c.NextHopIPv4); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid NEXT_HOP_IPV4: must be a valid IPv4 address")
+		}
+	}
+	if c.NextHopIPv6 != "" {
+		if ip := net.ParseIP(c.NextHopIPv6); ip == nil || ip.To4() != nil {
+			return fmt.Errorf("invalid NEXT_HOP_IPV6: must be a valid IPv6 address")
+		}
 	}
 
 	// Validate local address if specified
@@ -83,14 +93,35 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Validate prefixes
+	// Validate prefixes and ensure appropriate next-hop addresses are provided
 	if len(c.PrefixesToAnnounce) == 0 {
 		return fmt.Errorf("ANNOUNCED_PREFIXES: at least one prefix is required")
 	}
+	
+	hasIPv4Prefix := false
+	hasIPv6Prefix := false
+	
 	for i, prefix := range c.PrefixesToAnnounce {
 		if _, _, err := net.ParseCIDR(strings.TrimSpace(prefix)); err != nil {
 			return fmt.Errorf("invalid ANNOUNCED_PREFIXES[%d]: %v", i, err)
 		}
+		
+		// Check if this is an IPv4 or IPv6 prefix
+		if ip, _, err := net.ParseCIDR(strings.TrimSpace(prefix)); err == nil {
+			if ip.To4() != nil {
+				hasIPv4Prefix = true
+			} else {
+				hasIPv6Prefix = true
+			}
+		}
+	}
+	
+	// Ensure appropriate next-hop addresses are provided
+	if hasIPv4Prefix && c.NextHopIPv4 == "" {
+		return fmt.Errorf("NEXT_HOP_IPV4 is required when announcing IPv4 prefixes")
+	}
+	if hasIPv6Prefix && c.NextHopIPv6 == "" {
+		return fmt.Errorf("NEXT_HOP_IPV6 is required when announcing IPv6 prefixes")
 	}
 
 	// Validate URL
@@ -151,10 +182,9 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid PEER_ASN: %v", err)
 	}
 
-	nextHop := os.Getenv("NEXT_HOP")
-	if nextHop == "" {
-		return nil, fmt.Errorf("NEXT_HOP is required")
-	}
+	// Load separate IPv4 and IPv6 next-hop addresses (optional)
+	nextHopIPv4 := os.Getenv("NEXT_HOP_IPV4")
+	nextHopIPv6 := os.Getenv("NEXT_HOP_IPV6")
 
 	prefixesToAnnounce := os.Getenv("ANNOUNCED_PREFIXES")
 	if prefixesToAnnounce == "" {
@@ -192,7 +222,8 @@ func LoadConfig() (*Config, error) {
 		PeerIP:              peerIP,
 		PeerPort:            peerPort,
 		PeerASN:             uint32(peerASN),
-		NextHop:             nextHop,
+		NextHopIPv4:         nextHopIPv4,
+		NextHopIPv6:         nextHopIPv6,
 		PrefixesToAnnounce:  trimmedPrefixes,
 		HealthCheckURL:      healthCheckURL,
 		HealthCheckInterval: healthCheckInterval,
@@ -316,13 +347,27 @@ func (s *BGPServer) AnnouncePrefixes(ctx context.Context) error {
 
 		prefixLen, _ := prefix.Mask.Size()
 
-		// Determine address family
+		// Determine address family and next-hop
 		family := &api.Family{
 			Afi:  api.Family_AFI_IP,
 			Safi: api.Family_SAFI_UNICAST,
 		}
+		var nextHop string
 		if ip.To4() == nil {
 			family.Afi = api.Family_AFI_IP6
+			nextHop = s.config.NextHopIPv6
+		} else {
+			nextHop = s.config.NextHopIPv4
+		}
+
+		// Validate that we have a next-hop for this address family
+		if nextHop == "" {
+			if family.Afi == api.Family_AFI_IP {
+				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV4 is required for IPv4 prefix '%s'", prefixStr))
+			} else {
+				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV6 is required for IPv6 prefix '%s'", prefixStr))
+			}
+			continue
 		}
 
 		nlri, _ := anypb.New(&api.IPAddressPrefix{
@@ -349,7 +394,7 @@ func (s *BGPServer) AnnouncePrefixes(ctx context.Context) error {
 		attrs = append(attrs, asPathAttr)
 
 		nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
-			NextHop: s.config.NextHop,
+			NextHop: nextHop,
 		})
 		attrs = append(attrs, nextHopAttr)
 
@@ -376,7 +421,7 @@ func (s *BGPServer) AnnouncePrefixes(ctx context.Context) error {
 		announcedCount++
 		log.WithFields(log.Fields{
 			"prefix":   prefixStr,
-			"next-hop": s.config.NextHop,
+			"next-hop": nextHop,
 		}).Info("Announced prefix")
 	}
 
@@ -408,13 +453,27 @@ func (s *BGPServer) WithdrawPrefixes(ctx context.Context) error {
 
 		prefixLen, _ := prefix.Mask.Size()
 
-		// Determine address family
+		// Determine address family and next-hop
 		family := &api.Family{
 			Afi:  api.Family_AFI_IP,
 			Safi: api.Family_SAFI_UNICAST,
 		}
+		var nextHop string
 		if ip.To4() == nil {
 			family.Afi = api.Family_AFI_IP6
+			nextHop = s.config.NextHopIPv6
+		} else {
+			nextHop = s.config.NextHopIPv4
+		}
+
+		// Validate that we have a next-hop for this address family
+		if nextHop == "" {
+			if family.Afi == api.Family_AFI_IP {
+				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV4 is required for IPv4 prefix '%s'", prefixStr))
+			} else {
+				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV6 is required for IPv6 prefix '%s'", prefixStr))
+			}
+			continue
 		}
 
 		nlri, _ := anypb.New(&api.IPAddressPrefix{
@@ -441,7 +500,7 @@ func (s *BGPServer) WithdrawPrefixes(ctx context.Context) error {
 		attrs = append(attrs, asPathAttr)
 
 		nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
-			NextHop: s.config.NextHop,
+			NextHop: nextHop,
 		})
 		attrs = append(attrs, nextHopAttr)
 
