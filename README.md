@@ -9,7 +9,7 @@ A minimal BGP announcer that dynamically announces/withdraws a prefix based on H
 - `PEER_IP` - BGP peer IP address
 - `PEER_ASN` - BGP peer AS number
 - `NEXT_HOP` - Next-hop IP address for announcements
-- `PREFIX_TO_ANNOUNCE` - Prefix to announce in CIDR format
+- `ANNOUNCED_PREFIXES` - Prefix to announce in CIDR format, seperated by commas if there are multiple
 - `HEALTH_CHECK_URL` - Health check endpoint URL
 
 ## Optional Environment Variables

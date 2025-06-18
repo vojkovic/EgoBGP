@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 
 const (
 	// Version information
-	Version = "1.0.2"
+	Version = "1.1.0"
 
 	// Default values
 	defaultHealthCheckInterval = 10
@@ -47,7 +48,7 @@ type Config struct {
 	PeerPort            int
 	PeerASN             uint32
 	NextHop             string
-	PrefixToAnnounce    string
+	PrefixesToAnnounce  []string
 	HealthCheckURL      string
 	HealthCheckInterval int
 	SuccessThreshold    int
@@ -82,9 +83,14 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Validate prefix
-	if _, _, err := net.ParseCIDR(c.PrefixToAnnounce); err != nil {
-		return fmt.Errorf("invalid PREFIX_TO_ANNOUNCE: %v", err)
+	// Validate prefixes
+	if len(c.PrefixesToAnnounce) == 0 {
+		return fmt.Errorf("ANNOUNCED_PREFIXES: at least one prefix is required")
+	}
+	for i, prefix := range c.PrefixesToAnnounce {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(prefix)); err != nil {
+			return fmt.Errorf("invalid ANNOUNCED_PREFIXES[%d]: %v", i, err)
+		}
 	}
 
 	// Validate URL
@@ -150,9 +156,19 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("NEXT_HOP is required")
 	}
 
-	prefixToAnnounce := os.Getenv("PREFIX_TO_ANNOUNCE")
-	if prefixToAnnounce == "" {
-		return nil, fmt.Errorf("PREFIX_TO_ANNOUNCE is required")
+	prefixesToAnnounce := os.Getenv("ANNOUNCED_PREFIXES")
+	if prefixesToAnnounce == "" {
+		return nil, fmt.Errorf("ANNOUNCED_PREFIXES is required")
+	}
+
+	// Split and trim prefixes
+	prefixList := strings.Split(prefixesToAnnounce, ",")
+	var trimmedPrefixes []string
+	for _, prefix := range prefixList {
+		trimmed := strings.TrimSpace(prefix)
+		if trimmed != "" {
+			trimmedPrefixes = append(trimmedPrefixes, trimmed)
+		}
 	}
 
 	healthCheckURL := os.Getenv("HEALTH_CHECK_URL")
@@ -177,7 +193,7 @@ func LoadConfig() (*Config, error) {
 		PeerPort:            peerPort,
 		PeerASN:             uint32(peerASN),
 		NextHop:             nextHop,
-		PrefixToAnnounce:    prefixToAnnounce,
+		PrefixesToAnnounce:  trimmedPrefixes,
 		HealthCheckURL:      healthCheckURL,
 		HealthCheckInterval: healthCheckInterval,
 		SuccessThreshold:    successThreshold,
@@ -205,9 +221,9 @@ func getEnvInt(key string, defaultVal int) int {
 
 // BGPServer represents the BGP server instance
 type BGPServer struct {
-	s         *server.BgpServer
-	config    *Config
-	announced bool
+	s            *server.BgpServer
+	config       *Config
+	announcedSet map[string]bool
 }
 
 // NewBGPServer creates and configures a new BGP server instance
@@ -276,154 +292,187 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 	log.Infof("Configured peer: %s:%d (AS%d)", cfg.PeerIP, cfg.PeerPort, cfg.PeerASN)
 
 	return &BGPServer{
-		s:      s,
-		config: cfg,
+		s:            s,
+		config:       cfg,
+		announcedSet: make(map[string]bool),
 	}, nil
 }
 
-// Announce announces the configured prefix
-func (s *BGPServer) Announce(ctx context.Context) error {
-	if s.announced {
-		return nil
-	}
+// AnnouncePrefixes announces all configured prefixes
+func (s *BGPServer) AnnouncePrefixes(ctx context.Context) error {
+	var announcedCount int
+	var errors []string
 
-	ip, prefix, err := net.ParseCIDR(s.config.PrefixToAnnounce)
-	if err != nil {
-		return fmt.Errorf("invalid prefix format: %v", err)
-	}
+	for _, prefixStr := range s.config.PrefixesToAnnounce {
+		if s.announcedSet[prefixStr] {
+			continue // Already announced
+		}
 
-	prefixLen, _ := prefix.Mask.Size()
+		ip, prefix, err := net.ParseCIDR(prefixStr)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("invalid prefix format '%s': %v", prefixStr, err))
+			continue
+		}
 
-	// Determine address family
-	family := &api.Family{
-		Afi:  api.Family_AFI_IP,
-		Safi: api.Family_SAFI_UNICAST,
-	}
-	if ip.To4() == nil {
-		family.Afi = api.Family_AFI_IP6
-	}
+		prefixLen, _ := prefix.Mask.Size()
 
-	nlri, _ := anypb.New(&api.IPAddressPrefix{
-		Prefix:    prefix.IP.String(),
-		PrefixLen: uint32(prefixLen),
-	})
+		// Determine address family
+		family := &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		}
+		if ip.To4() == nil {
+			family.Afi = api.Family_AFI_IP6
+		}
 
-	// Create path attributes
-	attrs := []*anypb.Any{}
+		nlri, _ := anypb.New(&api.IPAddressPrefix{
+			Prefix:    prefix.IP.String(),
+			PrefixLen: uint32(prefixLen),
+		})
 
-	originAttr, _ := anypb.New(&api.OriginAttribute{
-		Origin: originIGP,
-	})
-	attrs = append(attrs, originAttr)
+		// Create path attributes
+		attrs := []*anypb.Any{}
 
-	asPathAttr, _ := anypb.New(&api.AsPathAttribute{
-		Segments: []*api.AsSegment{
-			{
-				Type:    asPathType,
-				Numbers: []uint32{s.config.LocalASN},
+		originAttr, _ := anypb.New(&api.OriginAttribute{
+			Origin: originIGP,
+		})
+		attrs = append(attrs, originAttr)
+
+		asPathAttr, _ := anypb.New(&api.AsPathAttribute{
+			Segments: []*api.AsSegment{
+				{
+					Type:    asPathType,
+					Numbers: []uint32{s.config.LocalASN},
+				},
 			},
-		},
-	})
-	attrs = append(attrs, asPathAttr)
+		})
+		attrs = append(attrs, asPathAttr)
 
-	nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
-		NextHop: s.config.NextHop,
-	})
-	attrs = append(attrs, nextHopAttr)
+		nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
+			NextHop: s.config.NextHop,
+		})
+		attrs = append(attrs, nextHopAttr)
 
-	medAttr, _ := anypb.New(&api.MultiExitDiscAttribute{
-		Med: medValue,
-	})
-	attrs = append(attrs, medAttr)
+		medAttr, _ := anypb.New(&api.MultiExitDiscAttribute{
+			Med: medValue,
+		})
+		attrs = append(attrs, medAttr)
 
-	_, err = s.s.AddPath(ctx, &api.AddPathRequest{
-		TableType: api.TableType_GLOBAL,
-		Path: &api.Path{
-			Family: family,
-			Nlri:   nlri,
-			Pattrs: attrs,
-		},
-	})
+		_, err = s.s.AddPath(ctx, &api.AddPathRequest{
+			TableType: api.TableType_GLOBAL,
+			Path: &api.Path{
+				Family: family,
+				Nlri:   nlri,
+				Pattrs: attrs,
+			},
+		})
 
-	if err != nil {
-		return fmt.Errorf("failed to announce prefix: %v", err)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("failed to announce prefix '%s': %v", prefixStr, err))
+			continue
+		}
+
+		s.announcedSet[prefixStr] = true
+		announcedCount++
+		log.WithFields(log.Fields{
+			"prefix":   prefixStr,
+			"next-hop": s.config.NextHop,
+		}).Info("Announced prefix")
 	}
 
-	s.announced = true
-	log.WithFields(log.Fields{
-		"prefix":   s.config.PrefixToAnnounce,
-		"next-hop": s.config.NextHop,
-	}).Info("Announced prefix")
+	if len(errors) > 0 {
+		return fmt.Errorf("some prefixes failed to announce: %s", strings.Join(errors, "; "))
+	}
+
+	if announcedCount > 0 {
+		log.WithField("count", announcedCount).Info("Successfully announced prefixes")
+	}
 	return nil
 }
 
-// Withdraw withdraws the configured prefix
-func (s *BGPServer) Withdraw(ctx context.Context) error {
-	if !s.announced {
-		return nil
-	}
+// WithdrawPrefixes withdraws all configured prefixes
+func (s *BGPServer) WithdrawPrefixes(ctx context.Context) error {
+	var withdrawnCount int
+	var errors []string
 
-	ip, prefix, err := net.ParseCIDR(s.config.PrefixToAnnounce)
-	if err != nil {
-		return fmt.Errorf("invalid prefix format: %v", err)
-	}
+	for _, prefixStr := range s.config.PrefixesToAnnounce {
+		if !s.announcedSet[prefixStr] {
+			continue // Not announced
+		}
 
-	prefixLen, _ := prefix.Mask.Size()
+		ip, prefix, err := net.ParseCIDR(prefixStr)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("invalid prefix format '%s': %v", prefixStr, err))
+			continue
+		}
 
-	// Determine address family
-	family := &api.Family{
-		Afi:  api.Family_AFI_IP,
-		Safi: api.Family_SAFI_UNICAST,
-	}
-	if ip.To4() == nil {
-		family.Afi = api.Family_AFI_IP6
-	}
+		prefixLen, _ := prefix.Mask.Size()
 
-	nlri, _ := anypb.New(&api.IPAddressPrefix{
-		Prefix:    prefix.IP.String(),
-		PrefixLen: uint32(prefixLen),
-	})
+		// Determine address family
+		family := &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		}
+		if ip.To4() == nil {
+			family.Afi = api.Family_AFI_IP6
+		}
 
-	// Create path attributes (must match announcement)
-	attrs := []*anypb.Any{}
+		nlri, _ := anypb.New(&api.IPAddressPrefix{
+			Prefix:    prefix.IP.String(),
+			PrefixLen: uint32(prefixLen),
+		})
 
-	originAttr, _ := anypb.New(&api.OriginAttribute{
-		Origin: originIGP,
-	})
-	attrs = append(attrs, originAttr)
+		// Create path attributes (must match announcement)
+		attrs := []*anypb.Any{}
 
-	asPathAttr, _ := anypb.New(&api.AsPathAttribute{
-		Segments: []*api.AsSegment{
-			{
-				Type:    asPathType,
-				Numbers: []uint32{s.config.LocalASN},
+		originAttr, _ := anypb.New(&api.OriginAttribute{
+			Origin: originIGP,
+		})
+		attrs = append(attrs, originAttr)
+
+		asPathAttr, _ := anypb.New(&api.AsPathAttribute{
+			Segments: []*api.AsSegment{
+				{
+					Type:    asPathType,
+					Numbers: []uint32{s.config.LocalASN},
+				},
 			},
-		},
-	})
-	attrs = append(attrs, asPathAttr)
+		})
+		attrs = append(attrs, asPathAttr)
 
-	nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
-		NextHop: s.config.NextHop,
-	})
-	attrs = append(attrs, nextHopAttr)
+		nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
+			NextHop: s.config.NextHop,
+		})
+		attrs = append(attrs, nextHopAttr)
 
-	err = s.s.DeletePath(ctx, &api.DeletePathRequest{
-		TableType: api.TableType_GLOBAL,
-		Path: &api.Path{
-			Family: family,
-			Nlri:   nlri,
-			Pattrs: attrs,
-		},
-	})
+		err = s.s.DeletePath(ctx, &api.DeletePathRequest{
+			TableType: api.TableType_GLOBAL,
+			Path: &api.Path{
+				Family: family,
+				Nlri:   nlri,
+				Pattrs: attrs,
+			},
+		})
 
-	if err != nil {
-		return fmt.Errorf("failed to withdraw prefix: %v", err)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("failed to withdraw prefix '%s': %v", prefixStr, err))
+			continue
+		}
+
+		delete(s.announcedSet, prefixStr)
+		withdrawnCount++
+		log.WithFields(log.Fields{
+			"prefix": prefixStr,
+		}).Info("Withdrawn prefix")
 	}
 
-	s.announced = false
-	log.WithFields(log.Fields{
-		"prefix": s.config.PrefixToAnnounce,
-	}).Info("Withdrawn prefix")
+	if len(errors) > 0 {
+		return fmt.Errorf("some prefixes failed to withdraw: %s", strings.Join(errors, "; "))
+	}
+
+	if withdrawnCount > 0 {
+		log.WithField("count", withdrawnCount).Info("Successfully withdrawn prefixes")
+	}
 	return nil
 }
 
@@ -583,9 +632,9 @@ func main() {
 	// Create health checker
 	checker := NewHealthChecker(cfg, func(healthy bool) error {
 		if healthy {
-			return server.Announce(ctx)
+			return server.AnnouncePrefixes(ctx)
 		}
-		return server.Withdraw(ctx)
+		return server.WithdrawPrefixes(ctx)
 	})
 
 	// Start health checker in a goroutine
