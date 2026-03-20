@@ -26,11 +26,11 @@ const (
 
 	// Default values
 	defaultHealthCheckInterval = 10
-	defaultSuccessThreshold   = 1
-	defaultFailureThreshold   = 4 // 4 failures before withdrawing
-	defaultBGPPort           = 179
-	bgpTimeout               = 5 * time.Second
-	healthCheckTimeout       = 5 * time.Second
+	defaultSuccessThreshold    = 1
+	defaultFailureThreshold    = 4 // 4 failures before withdrawing
+	defaultBGPPort             = 179
+	bgpTimeout                 = 5 * time.Second
+	healthCheckTimeout         = 5 * time.Second
 
 	// BGP constants
 	asPathType = 2 // AS_SEQUENCE
@@ -73,7 +73,7 @@ func (c *Config) validate() error {
 	if ip := net.ParseIP(c.PeerIP); ip == nil {
 		return fmt.Errorf("invalid PEER_IP: not a valid IP address")
 	}
-	
+
 	// Validate next-hop addresses
 	if c.NextHopIPv4 != "" {
 		if ip := net.ParseIP(c.NextHopIPv4); ip == nil || ip.To4() == nil {
@@ -97,25 +97,22 @@ func (c *Config) validate() error {
 	if len(c.PrefixesToAnnounce) == 0 {
 		return fmt.Errorf("ANNOUNCED_PREFIXES: at least one prefix is required")
 	}
-	
+
 	hasIPv4Prefix := false
 	hasIPv6Prefix := false
-	
+
 	for i, prefix := range c.PrefixesToAnnounce {
-		if _, _, err := net.ParseCIDR(strings.TrimSpace(prefix)); err != nil {
+		ip, _, err := net.ParseCIDR(strings.TrimSpace(prefix))
+		if err != nil {
 			return fmt.Errorf("invalid ANNOUNCED_PREFIXES[%d]: %v", i, err)
 		}
-		
-		// Check if this is an IPv4 or IPv6 prefix
-		if ip, _, err := net.ParseCIDR(strings.TrimSpace(prefix)); err == nil {
-			if ip.To4() != nil {
-				hasIPv4Prefix = true
-			} else {
-				hasIPv6Prefix = true
-			}
+		if ip.To4() != nil {
+			hasIPv4Prefix = true
+		} else {
+			hasIPv6Prefix = true
 		}
 	}
-	
+
 	// Ensure appropriate next-hop addresses are provided
 	if hasIPv4Prefix && c.NextHopIPv4 == "" {
 		return fmt.Errorf("NEXT_HOP_IPV4 is required when announcing IPv4 prefixes")
@@ -270,7 +267,7 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 		RouterId:   cfg.RouterID,
 		ListenPort: int32(cfg.LocalPort),
 	}
-	
+
 	if cfg.LocalAddress != "" {
 		global.ListenAddresses = []string{cfg.LocalAddress}
 	}
@@ -281,12 +278,6 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 		return nil, fmt.Errorf("failed to start BGP server: %v", err)
 	}
 
-	// Configure IPv4 and IPv6 families
-	families := []api.Family{
-		{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST},
-		{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST},
-	}
-
 	if err := s.AddPeer(ctx, &api.AddPeerRequest{
 		Peer: &api.Peer{
 			Conf: &api.PeerConf{
@@ -295,22 +286,13 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 				LocalAsn:        cfg.LocalASN,
 			},
 			Transport: &api.Transport{
-				PassiveMode: false,
 				RemotePort: uint32(cfg.PeerPort),
 				LocalPort:  uint32(cfg.LocalPort),
 			},
-			AfiSafis: func() []*api.AfiSafi {
-				afiSafis := make([]*api.AfiSafi, 0, len(families))
-				for _, f := range families {
-					afiSafis = append(afiSafis, &api.AfiSafi{
-						Config: &api.AfiSafiConfig{
-							Family:  &f,
-							Enabled: true,
-						},
-					})
-				}
-				return afiSafis
-			}(),
+			AfiSafis: []*api.AfiSafi{
+				{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}, Enabled: true}},
+				{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}, Enabled: true}},
+			},
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add peer: %v", err)
@@ -329,106 +311,91 @@ func NewBGPServer(cfg *Config) (*BGPServer, error) {
 	}, nil
 }
 
+// prefixInfo holds the resolved BGP attributes for a prefix.
+type prefixInfo struct {
+	family  *api.Family
+	nextHop string
+	nlri    *anypb.Any
+}
+
+// resolvePrefixInfo parses a CIDR prefix and resolves its BGP family, next-hop, and NLRI.
+func (s *BGPServer) resolvePrefixInfo(prefixStr string) (*prefixInfo, error) {
+	ip, prefix, err := net.ParseCIDR(prefixStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid prefix format '%s': %v", prefixStr, err)
+	}
+
+	prefixLen, _ := prefix.Mask.Size()
+
+	family := &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}
+	var nextHop string
+	if ip.To4() == nil {
+		family.Afi = api.Family_AFI_IP6
+		nextHop = s.config.NextHopIPv6
+	} else {
+		nextHop = s.config.NextHopIPv4
+	}
+
+	if nextHop == "" {
+		if family.Afi == api.Family_AFI_IP {
+			return nil, fmt.Errorf("NEXT_HOP_IPV4 is required for IPv4 prefix '%s'", prefixStr)
+		}
+		return nil, fmt.Errorf("NEXT_HOP_IPV6 is required for IPv6 prefix '%s'", prefixStr)
+	}
+
+	nlri, _ := anypb.New(&api.IPAddressPrefix{
+		Prefix:    prefix.IP.String(),
+		PrefixLen: uint32(prefixLen),
+	})
+
+	return &prefixInfo{family: family, nextHop: nextHop, nlri: nlri}, nil
+}
+
+// buildBaseAttrs builds the path attributes common to both announce and withdraw.
+func (s *BGPServer) buildBaseAttrs(nextHop string) []*anypb.Any {
+	originAttr, _ := anypb.New(&api.OriginAttribute{Origin: originIGP})
+	asPathAttr, _ := anypb.New(&api.AsPathAttribute{
+		Segments: []*api.AsSegment{{Type: asPathType, Numbers: []uint32{s.config.LocalASN}}},
+	})
+	nextHopAttr, _ := anypb.New(&api.NextHopAttribute{NextHop: nextHop})
+	return []*anypb.Any{originAttr, asPathAttr, nextHopAttr}
+}
+
 // AnnouncePrefixes announces all configured prefixes
 func (s *BGPServer) AnnouncePrefixes(ctx context.Context) error {
 	var announcedCount int
-	var errors []string
+	var errs []string
 
 	for _, prefixStr := range s.config.PrefixesToAnnounce {
 		if s.announcedSet[prefixStr] {
-			continue // Already announced
+			continue
 		}
 
-		ip, prefix, err := net.ParseCIDR(prefixStr)
+		info, err := s.resolvePrefixInfo(prefixStr)
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("invalid prefix format '%s': %v", prefixStr, err))
+			errs = append(errs, err.Error())
 			continue
 		}
 
-		prefixLen, _ := prefix.Mask.Size()
+		medAttr, _ := anypb.New(&api.MultiExitDiscAttribute{Med: medValue})
+		attrs := append(s.buildBaseAttrs(info.nextHop), medAttr)
 
-		// Determine address family and next-hop
-		family := &api.Family{
-			Afi:  api.Family_AFI_IP,
-			Safi: api.Family_SAFI_UNICAST,
-		}
-		var nextHop string
-		if ip.To4() == nil {
-			family.Afi = api.Family_AFI_IP6
-			nextHop = s.config.NextHopIPv6
-		} else {
-			nextHop = s.config.NextHopIPv4
-		}
-
-		// Validate that we have a next-hop for this address family
-		if nextHop == "" {
-			if family.Afi == api.Family_AFI_IP {
-				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV4 is required for IPv4 prefix '%s'", prefixStr))
-			} else {
-				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV6 is required for IPv6 prefix '%s'", prefixStr))
-			}
-			continue
-		}
-
-		nlri, _ := anypb.New(&api.IPAddressPrefix{
-			Prefix:    prefix.IP.String(),
-			PrefixLen: uint32(prefixLen),
-		})
-
-		// Create path attributes
-		attrs := []*anypb.Any{}
-
-		originAttr, _ := anypb.New(&api.OriginAttribute{
-			Origin: originIGP,
-		})
-		attrs = append(attrs, originAttr)
-
-		asPathAttr, _ := anypb.New(&api.AsPathAttribute{
-			Segments: []*api.AsSegment{
-				{
-					Type:    asPathType,
-					Numbers: []uint32{s.config.LocalASN},
-				},
-			},
-		})
-		attrs = append(attrs, asPathAttr)
-
-		nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
-			NextHop: nextHop,
-		})
-		attrs = append(attrs, nextHopAttr)
-
-		medAttr, _ := anypb.New(&api.MultiExitDiscAttribute{
-			Med: medValue,
-		})
-		attrs = append(attrs, medAttr)
-
-		_, err = s.s.AddPath(ctx, &api.AddPathRequest{
+		if _, err = s.s.AddPath(ctx, &api.AddPathRequest{
 			TableType: api.TableType_GLOBAL,
-			Path: &api.Path{
-				Family: family,
-				Nlri:   nlri,
-				Pattrs: attrs,
-			},
-		})
-
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("failed to announce prefix '%s': %v", prefixStr, err))
+			Path:      &api.Path{Family: info.family, Nlri: info.nlri, Pattrs: attrs},
+		}); err != nil {
+			errs = append(errs, fmt.Sprintf("failed to announce prefix '%s': %v", prefixStr, err))
 			continue
 		}
 
 		s.announcedSet[prefixStr] = true
 		announcedCount++
-		log.WithFields(log.Fields{
-			"prefix":   prefixStr,
-			"next-hop": nextHop,
-		}).Info("Announced prefix")
+		log.WithFields(log.Fields{"prefix": prefixStr, "next-hop": info.nextHop}).Info("Announced prefix")
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("some prefixes failed to announce: %s", strings.Join(errors, "; "))
+	if len(errs) > 0 {
+		return fmt.Errorf("some prefixes failed to announce: %s", strings.Join(errs, "; "))
 	}
-
 	if announcedCount > 0 {
 		log.WithField("count", announcedCount).Info("Successfully announced prefixes")
 	}
@@ -438,97 +405,35 @@ func (s *BGPServer) AnnouncePrefixes(ctx context.Context) error {
 // WithdrawPrefixes withdraws all configured prefixes
 func (s *BGPServer) WithdrawPrefixes(ctx context.Context) error {
 	var withdrawnCount int
-	var errors []string
+	var errs []string
 
 	for _, prefixStr := range s.config.PrefixesToAnnounce {
 		if !s.announcedSet[prefixStr] {
-			continue // Not announced
+			continue
 		}
 
-		ip, prefix, err := net.ParseCIDR(prefixStr)
+		info, err := s.resolvePrefixInfo(prefixStr)
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("invalid prefix format '%s': %v", prefixStr, err))
+			errs = append(errs, err.Error())
 			continue
 		}
 
-		prefixLen, _ := prefix.Mask.Size()
-
-		// Determine address family and next-hop
-		family := &api.Family{
-			Afi:  api.Family_AFI_IP,
-			Safi: api.Family_SAFI_UNICAST,
-		}
-		var nextHop string
-		if ip.To4() == nil {
-			family.Afi = api.Family_AFI_IP6
-			nextHop = s.config.NextHopIPv6
-		} else {
-			nextHop = s.config.NextHopIPv4
-		}
-
-		// Validate that we have a next-hop for this address family
-		if nextHop == "" {
-			if family.Afi == api.Family_AFI_IP {
-				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV4 is required for IPv4 prefix '%s'", prefixStr))
-			} else {
-				errors = append(errors, fmt.Sprintf("NEXT_HOP_IPV6 is required for IPv6 prefix '%s'", prefixStr))
-			}
-			continue
-		}
-
-		nlri, _ := anypb.New(&api.IPAddressPrefix{
-			Prefix:    prefix.IP.String(),
-			PrefixLen: uint32(prefixLen),
-		})
-
-		// Create path attributes (must match announcement)
-		attrs := []*anypb.Any{}
-
-		originAttr, _ := anypb.New(&api.OriginAttribute{
-			Origin: originIGP,
-		})
-		attrs = append(attrs, originAttr)
-
-		asPathAttr, _ := anypb.New(&api.AsPathAttribute{
-			Segments: []*api.AsSegment{
-				{
-					Type:    asPathType,
-					Numbers: []uint32{s.config.LocalASN},
-				},
-			},
-		})
-		attrs = append(attrs, asPathAttr)
-
-		nextHopAttr, _ := anypb.New(&api.NextHopAttribute{
-			NextHop: nextHop,
-		})
-		attrs = append(attrs, nextHopAttr)
-
-		err = s.s.DeletePath(ctx, &api.DeletePathRequest{
+		if err = s.s.DeletePath(ctx, &api.DeletePathRequest{
 			TableType: api.TableType_GLOBAL,
-			Path: &api.Path{
-				Family: family,
-				Nlri:   nlri,
-				Pattrs: attrs,
-			},
-		})
-
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("failed to withdraw prefix '%s': %v", prefixStr, err))
+			Path:      &api.Path{Family: info.family, Nlri: info.nlri, Pattrs: s.buildBaseAttrs(info.nextHop)},
+		}); err != nil {
+			errs = append(errs, fmt.Sprintf("failed to withdraw prefix '%s': %v", prefixStr, err))
 			continue
 		}
 
 		delete(s.announcedSet, prefixStr)
 		withdrawnCount++
-		log.WithFields(log.Fields{
-			"prefix": prefixStr,
-		}).Info("Withdrawn prefix")
+		log.WithField("prefix", prefixStr).Info("Withdrawn prefix")
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("some prefixes failed to withdraw: %s", strings.Join(errors, "; "))
+	if len(errs) > 0 {
+		return fmt.Errorf("some prefixes failed to withdraw: %s", strings.Join(errs, "; "))
 	}
-
 	if withdrawnCount > 0 {
 		log.WithField("count", withdrawnCount).Info("Successfully withdrawn prefixes")
 	}
@@ -549,11 +454,11 @@ func (s *BGPServer) Stop() error {
 
 // HealthChecker performs periodic health checks
 type HealthChecker struct {
-	client            *http.Client
-	config            *Config
-	handler           func(bool) error
-	successCount      int
-	failureCount      int
+	client             *http.Client
+	config             *Config
+	handler            func(bool) error
+	successCount       int
+	failureCount       int
 	lastCheckSucceeded bool
 }
 
@@ -711,6 +616,4 @@ func main() {
 		log.WithError(err).Error("Error stopping BGP server")
 		os.Exit(1)
 	}
-
-	os.Exit(0)
-} 
+}
